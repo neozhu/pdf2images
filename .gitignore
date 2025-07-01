@@ -329,3 +329,14 @@ MigrationBackup/
 
 # Rider IDE
 .idea/
+
+# Custom additions for this project
+# Publish directory
+publish/
+
+# Log files
+logs/
+*.log
+
+# Service installation directory (if created locally)
+C:/Services/
