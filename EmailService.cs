@@ -56,7 +56,12 @@ namespace pdf2images
                     IsBodyHtml = isHtml
                 };
                 
-                message.To.Add(_recipients);
+                // Handle multiple recipients separated by semicolon
+                var recipientList = _recipients.Split(';', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var recipient in recipientList)
+                {
+                    message.To.Add(recipient.Trim());
+                }
 
                 await client.SendMailAsync(message);
      

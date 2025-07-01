@@ -50,6 +50,36 @@ dotnet publish -c Release -o publish
 ```powershell
 .\install-service.ps1
 ```
+3. 手动创建Windows服务
+```powershell
+# 创建服务（注意参数格式）
+sc.exe create "PDF2Images" binpath= "C:\Services\PDF2Images\pdf2images.exe" DisplayName= "PDF to Images Converter Service" start= auto
+```
+4. 设置服务描述（可选）
+```
+# 创建服务（注意参数格式）
+sc.exe create "PDF2Images" binpath= "C:\Services\PDF2Images\pdf2images.exe" DisplayName= "PDF to Images Converter Service" start= auto
+```
+5. 启动服务
+```
+# 启动服务
+net start PDF2Images
+```
+手动删除/卸载服务
+
+1. 停止服务
+```
+net stop PDF2Images
+```
+2. 删除服务
+```
+sc.exe delete PDF2Images
+```
+3. 删除服务文件（可选）
+```
+Remove-Item -Path "C:\Services\PDF2Images" -Recurse -Force
+```
+故障排除
 
 详细安装说明请参阅 [SERVICE_INSTALLATION_GUIDE.md](SERVICE_INSTALLATION_GUIDE.md)
 
