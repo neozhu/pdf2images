@@ -72,6 +72,13 @@ namespace pdf2images
                         var archiveDirectory = Path.Combine(pdfDirectory, ".pdf");
                         Directory.CreateDirectory(archiveDirectory);
 
+                        //Create a .archive folder in the PDF file's directory
+                        var archivePath = Path.Combine(pdfDirectory, ".archive");
+                        if(!Directory.Exists(archivePath))
+                        {
+                            Directory.CreateDirectory(archivePath);
+                        }
+
                         // Initialize directory stats if not already present
                         if (!directoryStats.ContainsKey(pdfDirectory))
                         {
