@@ -66,7 +66,7 @@ namespace pdf2images
                 await client.SendMailAsync(message);
      
             }
-            catch (Exception ex)
+            catch (Exception)
             {
 
                 throw;
@@ -105,7 +105,7 @@ namespace pdf2images
                 await client.SendMailAsync(message);
                
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                
                 throw;

@@ -1,11 +1,10 @@
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using pdf2images;
 using Serilog;
-using Microsoft.Extensions.Configuration;
 
 // Configure unhandled exception handler for the entire application
 AppDomain.CurrentDomain.UnhandledException += (sender, args) => 
@@ -137,51 +136,59 @@ try
             flushToDiskInterval: TimeSpan.FromSeconds(1))
         .CreateLogger();
 
-    var builder = Host.CreateApplicationBuilder(args);
-    
-    // Use Serilog as the logging provider
-    builder.Services.AddSerilog();
-    
-    // Configure Windows Service support
-    builder.Services.AddWindowsService(options =>
-    {
-        options.ServiceName = "PDF2Images Service";
-    });
-    
-    // Register services for dependency injection
-    builder.Services.AddSingleton<EmailService>(provider => 
-        new EmailService(builder.Configuration));
-        
-    builder.Services.AddSingleton<Pdf2ImageService>(provider =>
-        new Pdf2ImageService(
-            builder.Configuration,
-            provider.GetRequiredService<EmailService>(),
-            provider.GetRequiredService<ILogger<Pdf2ImageService>>()));
-            
-    builder.Services.AddHostedService<Worker>();
+    // Create configuration
+    var configuration = new ConfigurationBuilder()
+        .AddJsonFile("appsettings.json", optional: false)
+        .AddJsonFile("appsettings.Development.json", optional: true)
+        .AddEnvironmentVariables()
+        .Build();
 
-    // Build the service provider
-    var host = builder.Build();
+    // Create logger factory for dependency injection
+    using var loggerFactory = LoggerFactory.Create(logging => 
+    {
+        logging.AddSerilog();
+    });
+
+    var logger = loggerFactory.CreateLogger<Pdf2ImageService>();
     
-    // Get the services
-    var serviceProvider = host.Services;
-    var emailService = serviceProvider.GetRequiredService<EmailService>();
-    var logger = serviceProvider.GetRequiredService<ILogger<Pdf2ImageService>>();
-    var pdf2ImageService = serviceProvider.GetRequiredService<Pdf2ImageService>();
-    // Run the host
-    await host.RunAsync();
+    // Create services directly
+    var emailService = new EmailService(configuration);
+    var pdf2ImageService = new Pdf2ImageService(configuration, emailService, logger);
+    
+    Log.Information("Starting PDF to Image conversion process...");
+    
+    // Create cancellation token for graceful shutdown
+    using var cts = new CancellationTokenSource();
+    
+    // Handle Ctrl+C for graceful shutdown
+    Console.CancelKeyPress += (sender, e) =>
+    {
+        e.Cancel = true; // Prevent immediate termination
+        Log.Information("Cancellation requested. Shutting down gracefully...");
+        cts.Cancel();
+    };
+    
+    // Run the PDF processing
+    await pdf2ImageService.ProcessAllAsync(batchSize: 10, cancellationToken: cts.Token);
+    
+    Log.Information("PDF to Image conversion completed successfully.");
+}
+catch (OperationCanceledException)
+{
+    Log.Information("PDF processing was canceled by user.");
 }
 catch (Exception ex)
 {
-    // Handle startup exceptions
-    Log.Fatal(ex, "Application startup failed");
-    await SendExceptionEmailAsync(ex, "Application Startup Error");
+    // Handle startup and processing exceptions
+    Log.Fatal(ex, "Application failed with error: {ErrorMessage}", ex.Message);
+    await SendExceptionEmailAsync(ex, "Application Error");
     
-    // Re-throw to terminate the application if it can't start properly
-    throw;
+    // Set exit code to indicate error
+    Environment.Exit(1);
 }
 finally
 {
+    Log.Information("Application shutting down...");
     Log.CloseAndFlush();
 }
 

@@ -1,13 +1,14 @@
 # PDF2Images
 
-PDF2Images 是一个.NET Windows服务应用程序，用于自动将PDF文件转换为图像文件。
+PDF2Images 是一个.NET控制台应用程序，用于自动将PDF文件转换为图像文件。
 
 ## 功能特点
 
-- PDF到图像的高质量转换
-- 支持多种图像格式输出
-- 可配置的转换参数
+- PDF到图像的高质量转换 (JPEG格式，150 DPI)
+- 支持OneDrive Files On-Demand自动下载
+- 批量处理PDF文件
 - 支持邮件通知功能
+- 优雅的取消和错误处理
 - 作为Windows服务自动运行
 - 文件日志记录和轮转
 - 资源保护和错误恢复
@@ -18,7 +19,7 @@ PDF2Images 是一个.NET Windows服务应用程序，用于自动将PDF文件转
 - 使用SkiaSharp和PDFtoImage库进行PDF处理
 - Microsoft.Extensions系列库用于依赖注入和配置
 - Serilog用于结构化日志记录
-- Windows Services支持
+- Windows Runtime API支持OneDrive文件处理
 
 ## 快速开始
 
@@ -26,27 +27,34 @@ PDF2Images 是一个.NET Windows服务应用程序，用于自动将PDF文件转
 
 - .NET 9.0 SDK（开发）或 .NET 9.0 Runtime（运行）
 - Windows 10/11 或 Windows Server 2019/2022
-- 管理员权限（安装服务时）
 
-### 开发和测试
+### 运行应用程序
 
 1. 克隆此仓库
 2. 配置`appsettings.json`中的OneDrive路径和SMTP设置
-3. 运行以下命令:
+3. 运行应用程序:
 
+#### 方式1：使用批处理文件
+```cmd
+run-pdf-converter.bat
+```
+
+#### 方式2：使用PowerShell脚本
+```powershell
+.\run-pdf-converter.ps1
+```
+
+#### 方式3：直接使用.NET CLI
 ```bash
 dotnet build
 dotnet run
 ```
 
-### 安装为Windows服务
+### 特殊功能
 
-1. 发布应用程序：
-```bash
-dotnet publish -c Release -o publish
-```
-
-2. 以管理员身份运行安装脚本：
+- **优雅停止**：按 Ctrl+C 可以安全停止正在运行的转换过程
+- **OneDrive支持**：自动处理OneDrive Files On-Demand占位符文件
+- **批量处理**：支持大量PDF文件的分批处理
 ```powershell
 .\install-service.ps1
 ```

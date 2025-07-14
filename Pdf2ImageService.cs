@@ -5,6 +5,10 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Windows.Storage;
+using Windows.Storage.FileProperties;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace pdf2images
 {
@@ -44,7 +48,12 @@ namespace pdf2images
             {
                 var pdfFiles = Directory
                     .EnumerateFiles(_sourcePath, "*.pdf", SearchOption.AllDirectories)
-                    .Where(p => !Path.GetDirectoryName(p).EndsWith(Path.DirectorySeparatorChar + ".pdf") && Path.GetDirectoryName(p)!= "Z1-template")
+                    .Where(p => {
+                        var directory = Path.GetDirectoryName(p);
+                        return directory != null && 
+                               !directory.EndsWith(Path.DirectorySeparatorChar + ".pdf") && 
+                               !directory.Contains("Z1-template");
+                    })
                     .ToList();
 
                 totalPdfCount = pdfFiles.Count;
@@ -67,6 +76,13 @@ namespace pdf2images
                         
                         var fileBase = Path.GetFileNameWithoutExtension(pdfPath);
                         var pdfDirectory = Path.GetDirectoryName(pdfPath);
+                        
+                        // Skip if directory is null (shouldn't happen, but for safety)
+                        if (string.IsNullOrEmpty(pdfDirectory))
+                        {
+                            _logger.LogError($"Could not determine directory for file: {pdfPath}");
+                            continue;
+                        }
                         
                         // Create a .pdf archive folder in the PDF file's directory
                         var archiveDirectory = Path.Combine(pdfDirectory, ".pdf");
@@ -198,71 +214,139 @@ namespace pdf2images
             Dictionary<string, (int TotalFiles, int SuccessFiles, int FailedFiles, int TotalPages)> directoryStats,
             CancellationToken cancellationToken)
         {
-            // Get the number of pages with limited memory usage
-            int pageCount;
-            using (var pdfStream = File.OpenRead(pdfPath))
+            try
             {
-                pageCount = Conversion.GetPageCount(pdfStream);
-            }
-            
-            int totalPageCount = 0;
-            
-            // Process each page individually to save memory
-            for (int pageIndex = 0; pageIndex < pageCount; pageIndex++)
-            {
-                // Check for cancellation between pages
-                cancellationToken.ThrowIfCancellationRequested();
+                // Ensure OneDrive file is downloaded before processing
+                await EnsureFileIsDownloadedAsync(pdfPath, cancellationToken);
                 
-                // Use the original PDF directory as the image save path
-                string imageName = $"{fileBase}-{pageIndex + 1}.jpeg";
-                string imagePath = Path.Combine(pdfDirectory, imageName);
-
-                // Open streams for only the current page
-                using (var inStream = File.OpenRead(pdfPath))
-                using (var outStream = File.Create(imagePath))
-                {
-                    Conversion.SaveJpeg(
-                        outStream,
-                        inStream,
-                        pageIndex,
-                        options: new(
-                            Dpi: 150,
-                            Height: 1200,
-                            WithAnnotations: true,
-                            WithFormFill: true,
-                            WithAspectRatio: true
-                        )
-                    );
-                }
+                // Get the number of pages with limited memory usage and retry logic
+                int pageCount = 0;
+                const int maxReadRetries = 3;
                 
-                totalPageCount++;
-                
-                // Brief pause between pages to prevent CPU spikes
-                if (pageIndex % 5 == 0 && pageIndex > 0)
+                for (int attempt = 0; attempt < maxReadRetries; attempt++)
                 {
                     try
                     {
-                        await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+                        using (var pdfStream = File.OpenRead(pdfPath))
+                        {
+                            pageCount = Conversion.GetPageCount(pdfStream);
+                        }
+                        break; // Success, exit retry loop
                     }
-                    catch (OperationCanceledException)
+                    catch (UnauthorizedAccessException ex) when (attempt < maxReadRetries - 1)
                     {
-                        // Ignore if we're shutting down
+                        _logger.LogWarning($"Access denied reading PDF (attempt {attempt + 1}), retrying: {pdfPath}. Error: {ex.Message}");
+                        await Task.Delay(1000 * (attempt + 1), cancellationToken);
+                        continue;
+                    }
+                    catch (IOException ex) when (attempt < maxReadRetries - 1)
+                    {
+                        _logger.LogWarning($"IO error reading PDF (attempt {attempt + 1}), retrying: {pdfPath}. Error: {ex.Message}");
+                        await Task.Delay(1000 * (attempt + 1), cancellationToken);
+                        continue;
                     }
                 }
+                
+                // Ensure we actually got the page count
+                if (pageCount == 0)
+                {
+                    throw new IOException($"Failed to read page count from PDF after {maxReadRetries} attempts: {pdfPath}");
+                }
+                
+                int totalPageCount = 0;
+                
+                // Process each page individually to save memory
+                for (int pageIndex = 0; pageIndex < pageCount; pageIndex++)
+                {
+                    // Check for cancellation between pages
+                    cancellationToken.ThrowIfCancellationRequested();
+                    
+                    // Use the original PDF directory as the image save path
+                    string imageName = $"{fileBase}-{pageIndex + 1}.jpeg";
+                    string imagePath = Path.Combine(pdfDirectory, imageName);
+
+                    // Open streams for only the current page with retry logic
+                    bool pageProcessed = false;
+                    for (int pageAttempt = 0; pageAttempt < 2; pageAttempt++)
+                    {
+                        try
+                        {
+                            using (var inStream = File.OpenRead(pdfPath))
+                            using (var outStream = File.Create(imagePath))
+                            {
+                                Conversion.SaveJpeg(
+                                    outStream,
+                                    inStream,
+                                    pageIndex,
+                                    options: new(
+                                        Dpi: 150,
+                                        Height: 1200,
+                                        WithAnnotations: true,
+                                        WithFormFill: true,
+                                        WithAspectRatio: true
+                                    )
+                                );
+                            }
+                            pageProcessed = true;
+                            break; // Success, exit retry loop
+                        }
+                        catch (Exception ex) when (pageAttempt < 1)
+                        {
+                            _logger.LogWarning($"Error processing page {pageIndex + 1} (attempt {pageAttempt + 1}), retrying: {ex.Message}");
+                            await Task.Delay(500, cancellationToken);
+                        }
+                    }
+                    
+                    if (!pageProcessed)
+                    {
+                        throw new IOException($"Failed to process page {pageIndex + 1} after retries");
+                    }
+                    
+                    totalPageCount++;
+                    
+                    // Brief pause between pages to prevent CPU spikes
+                    if (pageIndex % 5 == 0 && pageIndex > 0)
+                    {
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Ignore if we're shutting down
+                        }
+                    }
+                }
+
+                _logger.LogInformation($"Successfully processed {pdfPath}, total {pageCount} pages");
+
+                // After conversion, archive the original PDF to the .pdf subfolder in the PDF's directory
+                string destPdf = Path.Combine(pdfDirectory, ".pdf", Path.GetFileName(pdfPath));
+                File.Move(pdfPath, destPdf);
+                
+                // Update directory stats for successful conversion
+                var currentStats = directoryStats[pdfDirectory];
+                directoryStats[pdfDirectory] = (currentStats.TotalFiles, 
+                                               currentStats.SuccessFiles + 1, 
+                                               currentStats.FailedFiles, 
+                                               currentStats.TotalPages + pageCount);
             }
-
-            _logger.LogInformation($"Successfully processed {pdfPath}, total {pageCount} pages");
-
-            // After conversion, archive the original PDF to the .pdf subfolder in the PDF's directory
-            string destPdf = Path.Combine(pdfDirectory, ".pdf", Path.GetFileName(pdfPath));
-            File.Move(pdfPath, destPdf);
-            
-            // Update directory stats for successful conversion
-            var currentStats = directoryStats[pdfDirectory];
-            directoryStats[pdfDirectory] = (currentStats.TotalFiles, 
-                                           currentStats.SuccessFiles + 1, 
-                                           currentStats.FailedFiles, 
-                                           currentStats.TotalPages + pageCount);
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error in ProcessSingleFileAsync for file: {pdfPath}");
+                
+                // Add more specific error information for OneDrive-related issues
+                if (ex is UnauthorizedAccessException)
+                {
+                    _logger.LogError($"Access denied to file - this may be a OneDrive permissions issue: {pdfPath}");
+                }
+                else if (ex is IOException ioEx)
+                {
+                    _logger.LogError($"IO error accessing file - this may be a OneDrive sync issue: {pdfPath}. Details: {ioEx.Message}");
+                }
+                
+                throw; // Re-throw to be handled by the calling method
+            }
         }
 
         /// <summary>
@@ -387,5 +471,125 @@ namespace pdf2images
             await _emailService.SendEmailAsync(subject, bodyBuilder.ToString(), true);
             _logger.LogInformation($"Sent error notification email - {Path.GetFileName(pdfPath)}");
         }
+
+        /// <summary>
+        /// Ensures that a OneDrive file is fully downloaded before attempting to process it.
+        /// OneDrive files may exist as placeholders and need to be downloaded on first access.
+        /// </summary>
+        private async Task EnsureFileIsDownloadedAsync(string filePath, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var fileInfo = new FileInfo(filePath);
+                
+                // Check if file exists
+                if (!fileInfo.Exists)
+                {
+                    throw new FileNotFoundException($"File not found: {filePath}");
+                }
+                
+                // Check if this is a OneDrive placeholder file (reparse point)
+                bool isOnlinePlaceholder = fileInfo.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint);
+                
+                if (isOnlinePlaceholder)
+                {
+                    _logger.LogInformation($"OneDrive placeholder detected, triggering download: {Path.GetFileName(filePath)}");
+                    await TriggerOneDriveDownloadAsync(filePath, cancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to ensure file is downloaded: {filePath}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Triggers OneDrive download using StorageFile.GetBasicPropertiesAsync() which triggers download.
+        /// This is the recommended approach for handling OneDrive Files On-Demand.
+        /// </summary>
+        private async Task TriggerOneDriveDownloadAsync(string filePath, CancellationToken cancellationToken)
+        {
+            const int maxRetries = 3;
+            const int baseDelayMs = 1000;
+            
+            for (int attempt = 0; attempt < maxRetries; attempt++)
+            {
+                try
+                {
+                    // Method 1: Use StorageFile.GetBasicPropertiesAsync to trigger download
+                    try
+                    {
+                        StorageFile file = await StorageFile.GetFileFromPathAsync(filePath);
+                        BasicProperties properties = await file.GetBasicPropertiesAsync(); // 触发下载
+                        
+                        // Check if file status changed after accessing properties
+                        var fileInfo = new FileInfo(filePath);
+                        fileInfo.Refresh();
+                        
+                        if (!fileInfo.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+                        {
+                            _logger.LogInformation($"OneDrive file successfully downloaded: {Path.GetFileName(filePath)}");
+                        }
+                        return; // Success - properties access enables file access
+                    }
+                    catch (Exception storageEx)
+                    {
+                        _logger.LogWarning($"StorageFile approach failed, using fallback method: {storageEx.Message}");
+                        
+                        // Fallback: Traditional file access
+                        var fileInfo = new FileInfo(filePath);
+                        fileInfo.Refresh();
+                        
+                        // Access file properties to trigger download
+                        var attributes = fileInfo.Attributes;
+                        var length = fileInfo.Length;
+                        
+                        // Try to open file handle to trigger download
+                        using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                        {
+                            var streamLength = fileStream.Length;
+                            
+                            // Try to read first byte to ensure download
+                            if (streamLength > 0)
+                            {
+                                var buffer = new byte[1];
+                                _ = await fileStream.ReadAsync(buffer.AsMemory(0, 1), cancellationToken);
+                            }
+                        }
+                    }
+                    
+                    // Short delay to allow OneDrive to process
+                    await Task.Delay(300, cancellationToken);
+                    
+                    // Final check
+                    var finalFileInfo = new FileInfo(filePath);
+                    finalFileInfo.Refresh();
+                    var isStillPlaceholder = finalFileInfo.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint);
+                    
+                    if (!isStillPlaceholder)
+                    {
+                        _logger.LogInformation($"OneDrive file successfully downloaded: {Path.GetFileName(filePath)}");
+                    }
+                    return; // Even if still placeholder, we've triggered access
+                }
+                catch (Exception ex) when (attempt < maxRetries - 1)
+                {
+                    _logger.LogWarning($"OneDrive download attempt {attempt + 1} failed, retrying: {ex.Message}");
+                    await Task.Delay(baseDelayMs * (attempt + 1), cancellationToken);
+                    continue;
+                }
+                catch (Exception)
+                {
+                    if (attempt == maxRetries - 1)
+                    {
+                        // Don't throw - let the actual processing attempt handle the file access
+                        _logger.LogWarning($"Could not trigger OneDrive download after {maxRetries} attempts: {Path.GetFileName(filePath)}");
+                        return;
+                    }
+                }
+            }
+        }
+
     }
 }
