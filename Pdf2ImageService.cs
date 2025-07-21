@@ -52,7 +52,8 @@ namespace pdf2images
                         var directory = Path.GetDirectoryName(p);
                         return directory != null && 
                                !directory.EndsWith(Path.DirectorySeparatorChar + ".pdf") && 
-                               !directory.Contains("Z1-template");
+                               !directory.Contains("Z1-template") &&
+                               !directory.EndsWith(Path.DirectorySeparatorChar + ".broken");
                     })
                     .ToList();
 
@@ -93,6 +94,13 @@ namespace pdf2images
                         if(!Directory.Exists(archivePath))
                         {
                             Directory.CreateDirectory(archivePath);
+                        }
+
+                        //Create a .broken folder in the PDF file's directory for corrupted/invalid files
+                        var brokenPath = Path.Combine(pdfDirectory, ".broken");
+                        if(!Directory.Exists(brokenPath))
+                        {
+                            Directory.CreateDirectory(brokenPath);
                         }
 
                         // Initialize directory stats if not already present
@@ -227,6 +235,12 @@ namespace pdf2images
                 {
                     try
                     {
+                        // 验证文件是否为有效的PDF格式
+                        if (!IsValidPdfFile(pdfPath))
+                        {
+                            throw new InvalidDataException($"File is not a valid PDF format: {pdfPath}");
+                        }
+                        
                         using (var pdfStream = File.OpenRead(pdfPath))
                         {
                             pageCount = Conversion.GetPageCount(pdfStream);
@@ -245,12 +259,43 @@ namespace pdf2images
                         await Task.Delay(1000 * (attempt + 1), cancellationToken);
                         continue;
                     }
+                    catch (InvalidDataException ex) when (attempt < maxReadRetries - 1)
+                    {
+                        _logger.LogWarning($"PDF format validation failed (attempt {attempt + 1}), retrying: {pdfPath}. Error: {ex.Message}");
+                        // 等待更长时间，可能是OneDrive文件还在下载
+                        await Task.Delay(2000 * (attempt + 1), cancellationToken);
+                        continue;
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("File not in PDF format") && attempt < maxReadRetries - 1)
+                    {
+                        _logger.LogWarning($"PDF format error (attempt {attempt + 1}), retrying: {pdfPath}. Error: {ex.Message}");
+                        // 尝试重新触发OneDrive下载
+                        await EnsureFileIsDownloadedAsync(pdfPath, cancellationToken);
+                        await Task.Delay(2000 * (attempt + 1), cancellationToken);
+                        continue;
+                    }
+                    catch (InvalidDataException ex) when (attempt == maxReadRetries - 1)
+                    {
+                        // 最后一次尝试，移动到.broken目录
+                        string reason = $"Invalid PDF format after {maxReadRetries} attempts: {ex.Message}";
+                        await MoveBrokenFileAsync(pdfPath, reason);
+                        throw new InvalidDataException($"File moved to .broken directory. {reason}");
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("File not in PDF format") && attempt == maxReadRetries - 1)
+                    {
+                        // 最后一次尝试，移动到.broken目录
+                        string reason = $"PDF format error after {maxReadRetries} attempts: {ex.Message}";
+                        await MoveBrokenFileAsync(pdfPath, reason);
+                        throw new InvalidDataException($"File moved to .broken directory. {reason}");
+                    }
                 }
                 
                 // Ensure we actually got the page count
                 if (pageCount == 0)
                 {
-                    throw new IOException($"Failed to read page count from PDF after {maxReadRetries} attempts: {pdfPath}");
+                    string errorMessage = $"Failed to read page count from PDF after {maxReadRetries} attempts: {pdfPath}";
+                    await MoveBrokenFileAsync(pdfPath, $"Zero page count after {maxReadRetries} attempts");
+                    throw new IOException(errorMessage);
                 }
                 
                 int totalPageCount = 0;
@@ -292,8 +337,25 @@ namespace pdf2images
                         }
                         catch (Exception ex) when (pageAttempt < 1)
                         {
-                            _logger.LogWarning($"Error processing page {pageIndex + 1} (attempt {pageAttempt + 1}), retrying: {ex.Message}");
+                            // 检查是否是PDF格式错误
+                            if (ex.Message.Contains("File not in PDF format") || ex.Message.Contains("corrupted"))
+                            {
+                                _logger.LogWarning($"PDF format error processing page {pageIndex + 1} (attempt {pageAttempt + 1}): {ex.Message}");
+                                // 如果是格式错误，尝试重新确保文件下载
+                                await EnsureFileIsDownloadedAsync(pdfPath, cancellationToken);
+                            }
+                            else
+                            {
+                                _logger.LogWarning($"Error processing page {pageIndex + 1} (attempt {pageAttempt + 1}), retrying: {ex.Message}");
+                            }
                             await Task.Delay(500, cancellationToken);
+                        }
+                        catch (Exception ex) when (pageAttempt == 1 && (ex.Message.Contains("File not in PDF format") || ex.Message.Contains("corrupted")))
+                        {
+                            // 最后一次尝试仍然是PDF格式错误，移动到.broken目录
+                            string reason = $"PDF format error during page processing: {ex.Message}";
+                            await MoveBrokenFileAsync(pdfPath, reason);
+                            throw new InvalidDataException($"File moved to .broken directory. {reason}");
                         }
                     }
                     
@@ -321,8 +383,7 @@ namespace pdf2images
                 _logger.LogInformation($"Successfully processed {pdfPath}, total {pageCount} pages");
 
                 // After conversion, archive the original PDF to the .pdf subfolder in the PDF's directory
-                string destPdf = Path.Combine(pdfDirectory, ".pdf", Path.GetFileName(pdfPath));
-                File.Move(pdfPath, destPdf);
+                MoveToArchive(pdfPath, pdfDirectory);
                 
                 // Update directory stats for successful conversion
                 var currentStats = directoryStats[pdfDirectory];
@@ -560,7 +621,7 @@ namespace pdf2images
                     }
                     
                     // Short delay to allow OneDrive to process
-                    await Task.Delay(300, cancellationToken);
+                    await Task.Delay(2000, cancellationToken);
                     
                     // Final check
                     var finalFileInfo = new FileInfo(filePath);
@@ -588,6 +649,167 @@ namespace pdf2images
                         return;
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Validates if a file is a valid PDF format by checking the file header.
+        /// </summary>
+        private bool IsValidPdfFile(string filePath)
+        {
+            try
+            {
+                var fileInfo = new FileInfo(filePath);
+                
+                // Check file size - PDF files should be at least a few bytes
+                if (!fileInfo.Exists || fileInfo.Length < 8)
+                {
+                    return false;
+                }
+                
+                // Check PDF header - should start with "%PDF-"
+                using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    var header = new byte[5];
+                    int bytesRead = fileStream.Read(header, 0, 5);
+                    
+                    if (bytesRead < 5)
+                    {
+                        return false;
+                    }
+                    
+                    // PDF files start with "%PDF-"
+                    return header[0] == 0x25 && // %
+                           header[1] == 0x50 && // P
+                           header[2] == 0x44 && // D
+                           header[3] == 0x46 && // F
+                           header[4] == 0x2D;   // -
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"Error validating PDF file format: {filePath}. Error: {ex.Message}");
+                return false; // If we can't validate, assume it might be invalid
+            }
+        }
+
+        /// <summary>
+        /// Moves a corrupted or invalid PDF file to the .broken directory to prevent future processing attempts.
+        /// </summary>
+        private async Task MoveBrokenFileAsync(string pdfPath, string reason)
+        {
+            try
+            {
+                var pdfDirectory = Path.GetDirectoryName(pdfPath);
+                if (string.IsNullOrEmpty(pdfDirectory))
+                {
+                    _logger.LogError($"Cannot determine directory for broken file: {pdfPath}");
+                    return;
+                }
+
+                var brokenDirectory = Path.Combine(pdfDirectory, ".broken");
+                Directory.CreateDirectory(brokenDirectory);
+
+                var fileName = Path.GetFileName(pdfPath);
+                var brokenFilePath = Path.Combine(brokenDirectory, fileName);
+
+                // If a file with the same name already exists, add a timestamp to make it unique
+                int attempt = 1;
+                while (File.Exists(brokenFilePath))
+                {
+                    var fileNameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
+                    var fileExt = Path.GetExtension(fileName);
+                    var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    var newFileName = $"{fileNameWithoutExt}_{timestamp}_{attempt:000}{fileExt}";
+                    brokenFilePath = Path.Combine(brokenDirectory, newFileName);
+                    attempt++;
+                    
+                    // Safety check to prevent infinite loop
+                    if (attempt > 999)
+                    {
+                        _logger.LogError($"Unable to create unique filename for broken file after 999 attempts: {pdfPath}");
+                        return;
+                    }
+                }
+
+                // Move the file to the .broken directory
+                File.Move(pdfPath, brokenFilePath);
+                _logger.LogWarning($"Moved broken PDF file to .broken directory: {Path.GetFileName(brokenFilePath)}. Reason: {reason}");
+
+                // Create a text file with the error reason
+                var reasonFileName = $"{Path.GetFileNameWithoutExtension(brokenFilePath)}_reason.txt";
+                var reasonFilePath = Path.Combine(brokenDirectory, reasonFileName);
+                var reasonContent = $"Moved on: {DateTime.Now:yyyy-MM-dd HH:mm:ss}\nOriginal file: {Path.GetFileName(pdfPath)}\nReason: {reason}";
+                await File.WriteAllTextAsync(reasonFilePath, reasonContent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to move broken file to .broken directory: {pdfPath}");
+                
+                // If moving fails, at least try to log the issue to a central broken files log
+                try
+                {
+                    var logDirectory = Path.GetDirectoryName(pdfPath);
+                    if (!string.IsNullOrEmpty(logDirectory))
+                    {
+                        var logFilePath = Path.Combine(logDirectory, "broken_files_log.txt");
+                        var logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - Failed to move: {pdfPath} - Reason: {reason} - Error: {ex.Message}\n";
+                        await File.AppendAllTextAsync(logFilePath, logEntry);
+                    }
+                }
+                catch
+                {
+                    // If even logging fails, we've done our best
+                    _logger.LogError($"Could not log broken file information to broken_files_log.txt for: {pdfPath}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Moves a successfully processed PDF file to the .pdf archive directory, avoiding overwrites by renaming if necessary.
+        /// </summary>
+        private void MoveToArchive(string pdfPath, string pdfDirectory)
+        {
+            try
+            {
+                var archiveDirectory = Path.Combine(pdfDirectory, ".pdf");
+                Directory.CreateDirectory(archiveDirectory);
+
+                var fileName = Path.GetFileName(pdfPath);
+                var archiveFilePath = Path.Combine(archiveDirectory, fileName);
+
+                // If a file with the same name already exists, add a timestamp to make it unique
+                int attempt = 1;
+                while (File.Exists(archiveFilePath))
+                {
+                    var fileNameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
+                    var fileExt = Path.GetExtension(fileName);
+                    var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    var newFileName = $"{fileNameWithoutExt}_{timestamp}_{attempt:000}{fileExt}";
+                    archiveFilePath = Path.Combine(archiveDirectory, newFileName);
+                    attempt++;
+                    
+                    // Safety check to prevent infinite loop
+                    if (attempt > 999)
+                    {
+                        _logger.LogError($"Unable to create unique filename for archive after 999 attempts: {pdfPath}");
+                        // Fallback: use the current timestamp and milliseconds
+                        var fallbackName = $"{fileNameWithoutExt}_{DateTime.Now:yyyyMMdd_HHmmss_fff}{fileExt}";
+                        archiveFilePath = Path.Combine(archiveDirectory, fallbackName);
+                        break;
+                    }
+                }
+
+                // Move the file to the archive directory
+                File.Move(pdfPath, archiveFilePath);
+                _logger.LogInformation($"Archived processed PDF file: {Path.GetFileName(archiveFilePath)}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to move processed file to .pdf archive directory: {pdfPath}");
+                
+                // Re-throw the exception as this is a critical failure
+                throw;
             }
         }
 
